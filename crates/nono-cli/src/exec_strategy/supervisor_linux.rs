@@ -691,6 +691,9 @@ pub(super) enum NetworkDecision {
 ///    sockets like `/tmp/test.sock` are IPC bound to a real path, so the
 ///    supervisor canonicalizes that path and checks it against explicit
 ///    [`UnixSocketCapability`] grants.
+///    Targets that do not exist yet are checked via their canonicalized
+///    parent; if a grant covers the intended path, the syscall proceeds and
+///    fails with the kernel's native `ENOENT` instead of a policy denial.
 ///
 ///    **Abstract and unnamed `AF_UNIX` are denied.** The abstract namespace
 ///    (`sun_path[0] == '\0'`) lives outside the filesystem, so pathname
@@ -827,30 +830,24 @@ fn decide_af_unix_pathname(
         }
     };
 
-    let canonical = match op {
-        UnixSocketOp::Connect | UnixSocketOp::Send => match resolved_path.canonicalize() {
-            Ok(path) => path,
-            Err(err) => {
-                debug!(
-                    "Proxy seccomp: denying AF_UNIX {} on {}: canonicalize failed: {}",
-                    op,
-                    resolved_path.display(),
-                    err
-                );
-                return NetworkDecision::Deny;
-            }
-        },
-        UnixSocketOp::Bind => match canonicalize_unix_socket_bind_path(&resolved_path) {
-            Ok(path) => path,
-            Err(err) => {
-                debug!(
-                    "Proxy seccomp: denying AF_UNIX bind to {}: canonicalize failed: {}",
-                    resolved_path.display(),
-                    err
-                );
-                return NetworkDecision::Deny;
-            }
-        },
+    // Connect/send targets that do not exist yet resolve via their parent,
+    // exactly like bind targets and grant-time resolution in
+    // `UnixSocketCapability::new_file`. If a grant covers the intended path,
+    // the syscall is allowed and the kernel reports the native ENOENT.
+    // Daemon clients poll connect() on a socket the daemon has not bound
+    // yet and treat ENOENT as "retry", but a policy error as fatal; a
+    // pre-bind denial here breaks that startup handshake.
+    let canonical = match canonicalize_unix_socket_path(&resolved_path) {
+        Ok(path) => path,
+        Err(err) => {
+            debug!(
+                "Proxy seccomp: denying AF_UNIX {} on {}: canonicalize failed: {}",
+                op,
+                resolved_path.display(),
+                err
+            );
+            return NetworkDecision::Deny;
+        }
     };
 
     if unix_socket_allowlist_allows(config.unix_socket_allowlist, canonical.as_path(), op) {
@@ -905,9 +902,13 @@ fn unix_socket_allowlist_allows(
     })
 }
 
-fn canonicalize_unix_socket_bind_path(
-    path: &std::path::Path,
-) -> std::io::Result<std::path::PathBuf> {
+/// Canonicalize an AF_UNIX target path. If the final component does not
+/// exist (socket not bound yet), canonicalize the parent directory and
+/// re-append the component, matching grant-time resolution in
+/// `UnixSocketCapability::new_file`. A dangling-symlink final component
+/// resolves to the symlink's own path; the target it points at can only
+/// become connectable through a bind this same allowlist mediates.
+fn canonicalize_unix_socket_path(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     match path.canonicalize() {
         Ok(path) => Ok(path),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1310,10 +1311,7 @@ fn ipc_denial_details(
             };
             let resolved = resolve_af_unix_sockaddr_path(child_pid, path)
                 .unwrap_or_else(|_| path.to_path_buf());
-            let canonical = match op {
-                UnixSocketOp::Connect | UnixSocketOp::Send => resolved.canonicalize(),
-                UnixSocketOp::Bind => canonicalize_unix_socket_bind_path(&resolved),
-            };
+            let canonical = canonicalize_unix_socket_path(&resolved);
             let Ok(display_path) = canonical else {
                 return (
                     resolved.display().to_string(),
@@ -1995,6 +1993,95 @@ mod tests {
                     &config,
                 ),
                 NetworkDecision::Allow
+            );
+        }
+
+        /// Daemon-startup race (#1420 follow-up): a client polls connect() on
+        /// a granted socket path before the daemon binds it. The decision must
+        /// be Allow so the kernel returns its native ENOENT, not a policy
+        /// denial the client treats as fatal.
+        #[test]
+        fn af_unix_connect_to_missing_socket_with_file_grant_is_allowed() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "default.sock");
+            let allowlist = vec![
+                UnixSocketCapability::new_file(&path, UnixSocketMode::ConnectBind)
+                    .expect("socket grant"),
+            ];
+            let config = make_config(&backend, 0, Vec::new(), &allowlist);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Allow,
+                "connect to a granted-but-unbound socket must reach the kernel"
+            );
+        }
+
+        #[test]
+        fn af_unix_connect_to_missing_socket_in_dir_grant_is_allowed() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "missing.sock");
+            let allowlist = vec![
+                UnixSocketCapability::new_dir(dir.path(), UnixSocketMode::Connect)
+                    .expect("socket dir grant"),
+            ];
+            let config = make_config(&backend, 0, Vec::new(), &allowlist);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Allow
+            );
+        }
+
+        /// Fail closed: a nonexistent target outside any grant stays denied
+        /// even though its parent directory canonicalizes.
+        #[test]
+        fn af_unix_connect_to_missing_socket_without_grant_is_denied() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = socket_path(&dir, "missing.sock");
+            let config = make_config(&backend, 0, Vec::new(), &[]);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Deny
+            );
+        }
+
+        /// Fail closed: if even the parent directory does not exist, the
+        /// target cannot be anchored and the connect is denied.
+        #[test]
+        fn af_unix_connect_with_missing_parent_dir_is_denied() {
+            let backend = DenyAllBackend;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("no-such-dir").join("missing.sock");
+            let allowlist = vec![
+                UnixSocketCapability::new_dir_subtree(dir.path(), UnixSocketMode::ConnectBind)
+                    .expect("socket subtree grant"),
+            ];
+            let config = make_config(&backend, 0, Vec::new(), &allowlist);
+            assert_eq!(
+                decide_network_notification(
+                    test_pid(),
+                    SYS_CONNECT,
+                    &unix_pathname(&path),
+                    &config,
+                ),
+                NetworkDecision::Deny
             );
         }
 
