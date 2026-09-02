@@ -1168,14 +1168,6 @@ fn handle_received_network_notification(
         return Ok(());
     }
 
-    // Rate limit: guard AF_UNIX mediation decisions and proxy-mode decisions
-    // against notification flooding from a compromised child.
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited network seccomp notification, denying");
-        let _ = deny_notif(notify_fd, notif.id);
-        return Ok(());
-    }
-
     // TOCTOU check
     if !notif_id_valid(notify_fd, notif.id)? {
         debug!("Network seccomp notification expired (TOCTOU check)");
@@ -1186,6 +1178,21 @@ fn handle_received_network_notification(
         match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
             NetworkDecision::Allow => {}
             NetworkDecision::Deny => {
+                // Rate limit: only denials consume a token, so allowed traffic
+                // to granted sockets never competes with denied ambient
+                // traffic for the budget (#1420). When the bucket is empty the
+                // syscall still fails with EACCES, but the per-denial IPC
+                // record and audit-event work is skipped to bound flooding
+                // from a compromised child.
+                if !rate_limiter.try_acquire() {
+                    warn!(
+                        "Rate limited network seccomp denial (family={}, syscall={})",
+                        sockaddr.family, notif.data.nr
+                    );
+                    record_rate_limited_af_unix_denial(sockaddr, notif.data.nr, denials);
+                    respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
+                    return Ok(());
+                }
                 record_af_unix_ipc_denial(sockaddr, notif.pid, notif.data.nr, denials, ipc_denials);
                 respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
                 if let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr) {
@@ -1204,6 +1211,34 @@ fn handle_received_network_notification(
     }
 
     Ok(())
+}
+
+/// Cheap bounded record for a denial that hit the rate limiter. Uses the raw
+/// sockaddr path (no child-relative resolution or canonicalization) so a
+/// flooding child cannot force per-notification filesystem work.
+fn record_rate_limited_af_unix_denial(
+    sockaddr: &nono::sandbox::SockaddrInfo,
+    syscall: i32,
+    denials: &mut Vec<DenialRecord>,
+) {
+    if sockaddr.family != libc::AF_UNIX as u16 {
+        return;
+    }
+    let Some(path) = sockaddr.unix_path.as_deref() else {
+        return;
+    };
+    let access = match unix_socket_op_for_syscall(syscall) {
+        Some(UnixSocketOp::Bind) => AccessMode::ReadWrite,
+        _ => AccessMode::Read,
+    };
+    record_denial(
+        denials,
+        DenialRecord {
+            path: path.to_path_buf(),
+            access,
+            reason: DenialReason::RateLimited,
+        },
+    );
 }
 
 fn record_af_unix_ipc_denial(
@@ -2286,6 +2321,43 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49160), &config),
                 NetworkDecision::Allow
             );
+        }
+
+        mod rate_limited_denial_record {
+            use super::super::super::record_rate_limited_af_unix_denial;
+            use super::{inet_external, unix_abstract, unix_pathname};
+            use nono::AccessMode;
+            use nono::diagnostic::DenialReason;
+            use nono::sandbox::{SYS_BIND, SYS_CONNECT};
+            use std::path::Path;
+
+            #[test]
+            fn records_pathname_connect_as_read() {
+                let mut denials = Vec::new();
+                let sockaddr = unix_pathname(Path::new("/tmp/test.sock"));
+                record_rate_limited_af_unix_denial(&sockaddr, SYS_CONNECT, &mut denials);
+                assert_eq!(denials.len(), 1);
+                assert_eq!(denials[0].path, Path::new("/tmp/test.sock"));
+                assert_eq!(denials[0].access, AccessMode::Read);
+                assert_eq!(denials[0].reason, DenialReason::RateLimited);
+            }
+
+            #[test]
+            fn records_pathname_bind_as_readwrite() {
+                let mut denials = Vec::new();
+                let sockaddr = unix_pathname(Path::new("/tmp/test.sock"));
+                record_rate_limited_af_unix_denial(&sockaddr, SYS_BIND, &mut denials);
+                assert_eq!(denials.len(), 1);
+                assert_eq!(denials[0].access, AccessMode::ReadWrite);
+            }
+
+            #[test]
+            fn skips_non_af_unix_and_pathless_sockaddrs() {
+                let mut denials = Vec::new();
+                record_rate_limited_af_unix_denial(&inet_external(80), SYS_CONNECT, &mut denials);
+                record_rate_limited_af_unix_denial(&unix_abstract(), SYS_CONNECT, &mut denials);
+                assert!(denials.is_empty());
+            }
         }
     }
 }
