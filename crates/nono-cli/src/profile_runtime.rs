@@ -301,7 +301,12 @@ fn verify_stored_bundles(
             pack_ref,
         )?);
         if !artifact_path.exists() {
-            continue;
+            // Missing bundle artifacts must fail verification rather than be skipped.
+            return Err(nono::NonoError::PackageInstall(format!(
+                "trust bundle entry for '{}' in pack '{}' points at a missing path ('{}') - \
+                 reinstall with: nono pull {} --force",
+                artifact_name, pack_ref, installed_path, pack_ref
+            )));
         }
 
         let artifact_bytes = std::fs::read(&artifact_path).map_err(|e| {
@@ -1724,6 +1729,50 @@ mod tests {
         };
         assert!(
             err.to_string().contains("missing .nono-trust.bundle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_stored_bundles_rejects_entry_with_unresolvable_installed_path() {
+        let result = with_config_env(|config_dir| {
+            let artifact_content = r#"#!/bin/sh
+echo hi
+"#;
+            let (install_dir, _artifacts) = build_pack_with_scripts(
+                config_dir,
+                "acme",
+                "widget",
+                &[("hooks/before.sh", artifact_content)],
+            );
+
+            let bundle_json = serde_json::json!([{
+                "artifact": "hooks/before.sh",
+                "installed_path": "hooks/does-not-exist.sh",
+                "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                "bundle": {}
+            }])
+            .to_string();
+            let bundle_path = install_dir.join(".nono-trust.bundle");
+            fs::write(&bundle_path, bundle_json).expect("write trust bundle");
+
+            verify_stored_bundles(
+                &install_dir,
+                &bundle_path,
+                "acme/widget",
+                Some("https://github.com/acme/widget-ci@refs/heads/main"),
+            )
+        });
+
+        let err = match result {
+            Ok(()) => panic!(
+                "BUG: trust bundle entry with an unresolvable installed_path was silently \
+                 accepted, skipping Sigstore verification for hooks/before.sh"
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("points at a missing path"),
             "unexpected error: {err}"
         );
     }
