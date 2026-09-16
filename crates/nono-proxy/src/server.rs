@@ -2707,6 +2707,140 @@ mod tests {
         handle.shutdown();
     }
 
+    /// Servlet-style mock origin: strips `;...` path parameters from each
+    /// segment and resolves dot-segments, the way Tomcat/Jetty/Spring route
+    /// requests. Records every raw request-target it receives.
+    async fn spawn_servlet_upstream() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits_handle = std::sync::Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits_handle = std::sync::Arc::clone(&hits_handle);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let raw_target = head
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    hits_handle.lock().unwrap().push(raw_target);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), hits)
+    }
+
+    /// Regression for GHSA-8r33-hr9m-69wh: the endpoint policy matched a
+    /// normalized path while the raw path was forwarded upstream. A segment
+    /// like `..;jsessionid=1` is an opaque literal to the normalizer but a
+    /// dot-segment to servlet upstreams (which strip `;` path parameters),
+    /// so a deny rule on `/v1/secrets/**` could be escaped via an allowed
+    /// sibling prefix. Ambiguous paths must now be denied at the proxy.
+    #[tokio::test]
+    async fn test_endpoint_policy_denies_path_parameter_traversal_end_to_end() {
+        use crate::config::{
+            EndpointPolicyConfig, EndpointPolicyDecision, EndpointPolicyDefault, EndpointPolicyRule,
+        };
+
+        let (upstream, hits) = spawn_servlet_upstream().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.endpoint_policy = Some(EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![EndpointPolicyRule {
+                method: "*".to_string(),
+                path: "/v1/secrets/**".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        });
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        // Control 1: the deny rule works on the direct path.
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/v1/secrets/token HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "direct denied path must get 403, got: {response:?}"
+        );
+
+        // Control 2: a clean allowed path still reaches the upstream.
+        let response = send_raw_request(
+            handle.port,
+            b"GET /svc/v1/public/info HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "clean allowed path must reach the upstream, got: {response:?}"
+        );
+
+        // The advisory PoC path and encoded relatives: each must be refused
+        // by the proxy, not forwarded for the upstream to reinterpret.
+        for exploit in [
+            "/svc/v1/public/..;jsessionid=1/secrets/token".to_string(),
+            "/svc/v1/public/%2e%2e/secrets/token".to_string(),
+            "/svc/v1/public/%252e%252e/secrets/token".to_string(),
+        ] {
+            let request = format!("GET {exploit} HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+            let response = send_raw_request(handle.port, request.as_bytes()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "ambiguous path {exploit} must get 403, got: {response:?}"
+            );
+        }
+
+        // The upstream must have seen only the clean allowed request.
+        let seen = hits.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec!["/v1/public/info".to_string()],
+            "no ambiguous path may reach the upstream"
+        );
+
+        // The audit log must record the ambiguity denials.
+        let events = handle.drain_audit_events();
+        assert!(
+            events.iter().any(|e| {
+                e.endpoint_policy_rule.as_deref() == Some("endpoint_policy.ambiguous_path")
+            }),
+            "expected an ambiguous_path policy denial in the audit log, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn test_websocket_upgrade_malformed_returns_400() {
         // A request that claims to be an upgrade but is missing required
