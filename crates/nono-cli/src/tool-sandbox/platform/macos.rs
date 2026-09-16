@@ -608,6 +608,19 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
         return true;
     }
 
+    // A shim copy with a missing/invalid handshake must not fall through to
+    // Cli::parse(), which would parse its argv as top-level nono subcommands
+    // (ps, stop, rollback, ...) against unrelated sessions.
+    if current_exe_is_tool_sandbox_shim_copy_by_path() {
+        exit_from_result(Err(NonoError::SandboxInit(
+            "running as a tool-sandbox shim copy but the broker handshake \
+             (NONO_TOOL_SANDBOX_SOCKET / NONO_TOOL_SANDBOX_SHIM_DIR) is missing \
+             or invalid; refusing rather than falling back to the nono CLI"
+                .to_string(),
+        )));
+        return true;
+    }
+
     false
 }
 
@@ -632,6 +645,31 @@ fn current_exe_is_tool_sandbox_shim() -> bool {
         return false;
     };
     exe.starts_with(shim_dir)
+}
+
+/// Identity check independent of [`TOOL_SANDBOX_SHIM_DIR_ENV`]; used only to
+/// refuse execution, never to grant broker access.
+fn current_exe_is_tool_sandbox_shim_copy_by_path() -> bool {
+    std::env::current_exe()
+        .map(|exe| path_has_tool_sandbox_shim_shape(&exe))
+        .unwrap_or(false)
+}
+
+fn path_has_tool_sandbox_shim_shape(exe: &Path) -> bool {
+    let Some(shims_dir) = exe.parent() else {
+        return false;
+    };
+    if shims_dir.file_name().and_then(OsStr::to_str) != Some("shims") {
+        return false;
+    }
+    let Some(runtime_dir_name) = shims_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+    else {
+        return false;
+    };
+    runtime_dir_name.starts_with("nono-tool-sandbox-")
 }
 
 fn run_shim() -> Result<()> {
@@ -5559,6 +5597,36 @@ mod tests {
         InterceptActionConfig, InterceptRuleConfig, ResolvedExecutableKind,
         ResolvedExecutableShape,
     };
+
+    #[test]
+    fn shim_shape_matches_materialised_shim_copy() {
+        assert!(path_has_tool_sandbox_shim_shape(Path::new(
+            "/private/tmp/nono-tool-sandbox-abc123/shims/git"
+        )));
+    }
+
+    #[test]
+    fn shim_shape_rejects_wrong_parent_dir_name() {
+        // Not inside a `shims/` directory at all.
+        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
+            "/private/tmp/nono-tool-sandbox-abc123/git"
+        )));
+    }
+
+    #[test]
+    fn shim_shape_rejects_wrong_grandparent_prefix() {
+        // `shims/` exists, but its parent isn't a `nono-tool-sandbox-*` dir.
+        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
+            "/private/tmp/some-other-dir/shims/git"
+        )));
+    }
+
+    #[test]
+    fn shim_shape_rejects_arbitrary_copy() {
+        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
+            "/tmp/notshim/git"
+        )));
+    }
 
     fn test_binary(name: &str, path: &Path) -> Result<ResolvedCommandBinary> {
         let canonical = path
