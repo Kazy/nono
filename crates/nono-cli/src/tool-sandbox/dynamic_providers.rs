@@ -466,7 +466,7 @@ pub(super) mod git {
         }
         let stdout = String::from_utf8(output.stdout)
             .map_err(|e| NonoError::ProfileParse(format!("git config produced non-UTF-8: {e}")))?;
-        Ok(parse_paths_from_stdout(&stdout))
+        Ok(parse_paths_from_stdout(&stdout, outer_caps))
     }
 
     /// Parse the stdout of `git config --list --show-origin --show-scope`
@@ -474,7 +474,10 @@ pub(super) mod git {
     ///
     /// Only `global` and `system` scopes are kept; `local` and `worktree`
     /// are dropped (attacker-controlled per-repo `.git/config` threat model).
-    pub(super) fn parse_paths_from_stdout(stdout: &str) -> GitConfigPaths {
+    pub(super) fn parse_paths_from_stdout(
+        stdout: &str,
+        outer_caps: &nono::CapabilitySet,
+    ) -> GitConfigPaths {
         use std::collections::BTreeSet;
 
         const FILE_PATH_KEYS: &[&str] = &[
@@ -499,8 +502,8 @@ pub(super) mod git {
             let Some((origin, rest)) = after_scope.split_once('\t') else {
                 continue;
             };
-            if let Some(path) = origin.strip_prefix("file:")
-                && !path.is_empty()
+            let origin_path = origin.strip_prefix("file:").filter(|p| !p.is_empty());
+            if let Some(path) = origin_path
                 && files_seen.insert(path.to_string())
             {
                 out.files.push(path.to_string());
@@ -513,6 +516,16 @@ pub(super) mod git {
             if value.is_empty() {
                 continue;
             }
+
+            // Skip values from a config file the agent can write, or it could
+            // set e.g. core.hooksPath itself and have it trusted as an admin's.
+            let origin_agent_writable = origin_path.is_some_and(|p| {
+                super::super::caps_grant(outer_caps, Path::new(p), nono::AccessMode::Write)
+            });
+            if origin_agent_writable {
+                continue;
+            }
+
             if FILE_PATH_KEYS.contains(&key_lower.as_str()) && files_seen.insert(value.to_string())
             {
                 out.files.push(value.to_string());
@@ -522,9 +535,8 @@ pub(super) mod git {
                 out.dirs.push(value.to_string());
             }
 
-            // `include.path` / `includeIf.*.path` targets are folded into
-            // `files` regardless of whether their condition fires, so a
-            // not-yet-matching conditional include is still grantable.
+            // Folded into `files` even if the includeIf condition doesn't
+            // currently match, so it stays grantable if it later does.
             if is_include_path_key(&key_lower) && files_seen.insert(value.to_string()) {
                 out.files.push(value.to_string());
             }
@@ -728,7 +740,7 @@ global\tfile:/home/u/.gitconfig-work\tcommit.template=/tmp/template
 command\tcmdline:\tcore.editor=vim
 global\tfile:/home/u/.gitconfig\tinclude.path=~/.gitconfig-work
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         assert!(out.files.contains(&"/home/u/.gitconfig".to_string()));
         assert!(out.files.contains(&"/home/u/.gitconfig-work".to_string()));
         assert!(out.dirs.is_empty(), "dirs should be empty: {:?}", out.dirs);
@@ -741,7 +753,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 global\tfile:/home/u/.gitconfig\tuser.email=alice@example.com
 global\tfile:/home/u/.gitconfig\tcore.editor=vim
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         let count = out
             .files
             .iter()
@@ -757,7 +769,7 @@ command\tcmdline:\tcore.editor=vim
 local\tblob:HEAD:.gitmodules\tsubmodule.foo.url=x
 global\tstandard input:\tuser.name=Alice
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         assert!(out.files.is_empty(), "got files {:?}", out.files);
         assert!(out.dirs.is_empty(), "got dirs {:?}", out.dirs);
     }
@@ -770,7 +782,7 @@ local\tfile:/repo/.git/config\tcore.attributesFile=/etc/passwd
 worktree\tfile:/repo/.git/config.worktree\tcore.hooksPath=/etc/sudoers.d
 system\tfile:/etc/gitconfig\tcommit.template=/etc/git-template
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         assert!(out.files.contains(&"/home/u/.gitattributes".to_string()));
         assert!(out.files.contains(&"/etc/git-template".to_string()));
         assert!(out.files.contains(&"/home/u/.gitconfig".to_string()));
@@ -791,7 +803,7 @@ global\tfile:/home/u/.gitconfig\tincludeif.hasconfig:remote.*.url:git@github.com
 global\tfile:/home/u/.gitconfig\tincludeif.gitdir:~/work/.path=/home/u/.gitconfig-work
 global\tfile:/home/u/.gitconfig\tuser.name=Alice
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         assert!(
             out.files.contains(&"~/.gitconfig-common".to_string()),
             "include.path target missing from files: {:?}",
@@ -815,7 +827,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
 local\tfile:/repo/.git/config\tinclude.path=/etc/evil-include
 worktree\tfile:/repo/.git/config.worktree\tincludeif.gitdir:/**.path=/etc/evil-worktree
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         for leaked in ["/etc/evil-include", "/etc/evil-worktree"] {
             assert!(
                 !out.files.iter().any(|p| p == leaked),
@@ -874,7 +886,7 @@ worktree\tfile:/repo/.git/config.worktree\tincludeif.gitdir:/**.path=/etc/evil-w
 global\tfile:/home/u/.gitconfig\tcore.hooksPath=/home/u/.githooks
 global\tfile:/home/u/.gitconfig\tcore.attributesFile=/home/u/.gitattributes
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         assert_eq!(out.dirs, vec!["/home/u/.githooks".to_string()]);
         assert!(out.files.contains(&"/home/u/.gitattributes".to_string()));
         assert!(
@@ -882,6 +894,57 @@ global\tfile:/home/u/.gitconfig\tcore.attributesFile=/home/u/.gitattributes
             "hooksPath leaked into files: {:?}",
             out.files
         );
+    }
+
+    /// Values from an agent-writable config file must not be trusted.
+    #[test]
+    fn parse_paths_from_stdout_drops_path_values_from_agent_writable_origin() {
+        use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+
+        let stdout = "\
+global\tfile:/home/u/.gitconfig\tcore.hooksPath=/etc/protected-dir
+global\tfile:/home/u/.gitconfig\tcore.attributesFile=/etc/protected-file
+global\tfile:/home/u/.gitconfig\tinclude.path=/etc/protected-include
+";
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: "/home/u/.gitconfig".into(),
+            resolved: "/home/u/.gitconfig".into(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let out = git::parse_paths_from_stdout(stdout, &caps);
+        assert!(
+            out.files.contains(&"/home/u/.gitconfig".to_string()),
+            "origin config file itself must still be recorded: {:?}",
+            out.files
+        );
+        for untrusted in [
+            "/etc/protected-dir",
+            "/etc/protected-file",
+            "/etc/protected-include",
+        ] {
+            assert!(
+                !out.files.iter().any(|p| p == untrusted)
+                    && !out.dirs.iter().any(|p| p == untrusted),
+                "value from agent-writable origin must not be trusted: {untrusted} leaked into {out:?}",
+            );
+        }
+    }
+
+    /// Non-agent-writable origins (the admin-managed case) are unaffected.
+    #[test]
+    fn parse_paths_from_stdout_keeps_path_values_from_non_agent_writable_origin() {
+        let stdout = "\
+global\tfile:/home/u/.gitconfig\tcore.hooksPath=/home/u/.githooks
+global\tfile:/home/u/.gitconfig\tcore.attributesFile=/home/u/.gitattributes
+";
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
+        assert_eq!(out.dirs, vec!["/home/u/.githooks".to_string()]);
+        assert!(out.files.contains(&"/home/u/.gitattributes".to_string()));
+        assert!(out.files.contains(&"/home/u/.gitconfig".to_string()));
     }
 
     #[test]
@@ -1050,7 +1113,7 @@ global\tfile:/home/u/.gitconfig\tcore.hooksPath=~/.githooks
 global\tfile:/home/u/.gitconfig\tcommit.template=~/.gitmessage
 global\tfile:/home/u/.gitconfig\tuser.name=Alice
 ";
-        let out = git::parse_paths_from_stdout(stdout);
+        let out = git::parse_paths_from_stdout(stdout, &nono::CapabilitySet::default());
         assert!(out.files.contains(&"~/.gitattributes".to_string()));
         assert!(out.files.contains(&"~/.gitexcludes".to_string()));
         assert!(out.files.contains(&"~/.gitmessage".to_string()));
