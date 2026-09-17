@@ -305,6 +305,12 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub query_param_name: Option<String>,
 
+    // --- JSON body mode fields ---
+    /// Dotted path of the JSON body field that carries the credential
+    /// (e.g. "data.TOKEN"). Only used when inject_mode is "json_body".
+    #[serde(default)]
+    pub body_field: Option<String>,
+
     /// Optional overrides for proxy-side phantom token handling.
     ///
     /// When set, these values control how the local proxy validates incoming
@@ -729,6 +735,9 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
                 // No additional required fields for basic_auth mode
                 // Credential value is expected to be "username:password" format
             }
+            InjectMode::JsonBody => {
+                validate_body_field(name, "body_field", cred.body_field.as_deref())?;
+            }
         }
     }
 
@@ -854,8 +863,33 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
                 )));
             }
         }
+        InjectMode::JsonBody => {
+            validate_body_field(
+                name,
+                "proxy.body_field",
+                proxy.body_field.as_deref().or(cred.body_field.as_deref()),
+            )?;
+        }
     }
 
+    Ok(())
+}
+
+/// Validate a dotted JSON path for json_body mode. Every segment is a
+/// literal object key; an empty segment can never match a key.
+fn validate_body_field(name: &str, field: &str, value: Option<&str>) -> Result<()> {
+    let path = value.ok_or_else(|| {
+        NonoError::ProfileParse(format!(
+            "{} is required for custom credential '{}' with inject_mode 'json_body'",
+            field, name
+        ))
+    })?;
+    if path.split('.').any(str::is_empty) {
+        return Err(NonoError::ProfileParse(format!(
+            "{} '{}' for custom credential '{}' must be a dotted path of non-empty JSON keys",
+            field, path, name
+        )));
+    }
     Ok(())
 }
 
@@ -1241,6 +1275,7 @@ fn custom_credential_from_manifest_entry(cred: &nono::manifest::Credential) -> C
         path_pattern,
         path_replacement,
         query_param_name,
+        body_field: None,
         proxy: None,
         env_var: cred
             .env_var
@@ -5646,6 +5681,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -5953,6 +5989,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6069,6 +6106,7 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6096,6 +6134,7 @@ mod tests {
             path_pattern: None, // Missing required field
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6125,6 +6164,7 @@ mod tests {
             path_pattern: Some("/bot/token/".to_string()), // No {} placeholder
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6154,6 +6194,7 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot{}/".to_string()),
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6181,6 +6222,7 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot/fixed/".to_string()), // No {} placeholder
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6210,6 +6252,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("key".to_string()),
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6237,6 +6280,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None, // Missing required field
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6266,6 +6310,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("".to_string()), // Empty
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6295,6 +6340,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -6311,6 +6357,87 @@ mod tests {
         assert!(validate_custom_credential("example", &cred).is_ok());
     }
 
+    fn json_body_cred_builder() -> CustomCredentialDef {
+        let mut cred = header_cred_builder();
+        cred.inject_mode = InjectMode::JsonBody;
+        cred.body_field = Some("data.TOKEN".to_string());
+        cred
+    }
+
+    #[test]
+    fn test_validate_json_body_mode_valid() {
+        assert!(validate_custom_credential("snowflake", &json_body_cred_builder()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_json_body_mode_requires_body_field() {
+        let mut cred = json_body_cred_builder();
+        cred.body_field = None;
+        let err = validate_custom_credential("snowflake", &cred).expect_err("must reject");
+        assert!(err.to_string().contains("body_field is required"));
+    }
+
+    #[test]
+    fn test_validate_json_body_mode_rejects_empty_segments() {
+        for path in ["", ".", "data.", ".TOKEN", "data..TOKEN"] {
+            let mut cred = json_body_cred_builder();
+            cred.body_field = Some(path.to_string());
+            let err = validate_custom_credential("snowflake", &cred).expect_err(path);
+            assert!(
+                err.to_string().contains("non-empty JSON keys"),
+                "{path:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_json_body_mode_ignores_body_field_for_oauth2_routes() {
+        // Mode-specific checks only apply to credential_key routes.
+        let mut cred = oauth2_cred_builder();
+        cred.inject_mode = InjectMode::JsonBody;
+        cred.body_field = None;
+        assert!(validate_custom_credential("svc", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_proxy_override_json_body_requires_field() {
+        let mut cred = header_cred_builder();
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: Some(InjectMode::JsonBody),
+            inject_header: None,
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            body_field: None,
+        });
+        let err = validate_custom_credential("test", &cred).expect_err("must reject");
+        assert!(err.to_string().contains("proxy.body_field is required"));
+
+        cred.body_field = Some("data.TOKEN".to_string());
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_json_body_profile_round_trips_through_json() {
+        let json = r#"{
+            "upstream": "https://acct.snowflakecomputing.com",
+            "credential_key": "file:///tmp/pat",
+            "env_var": "SNOWFLAKE_TOKEN",
+            "inject_mode": "json_body",
+            "body_field": "data.TOKEN",
+            "proxy": { "body_field": "data.PHANTOM" }
+        }"#;
+        let cred: CustomCredentialDef = serde_json::from_str(json).expect("parse");
+        assert_eq!(cred.inject_mode, InjectMode::JsonBody);
+        assert_eq!(cred.body_field.as_deref(), Some("data.TOKEN"));
+        assert_eq!(
+            cred.proxy.as_ref().and_then(|p| p.body_field.as_deref()),
+            Some("data.PHANTOM")
+        );
+        assert!(validate_custom_credential("snowflake", &cred).is_ok());
+    }
+
     #[test]
     fn test_validate_proxy_override_query_param_requires_name() {
         let mut cred = header_cred_builder();
@@ -6321,6 +6448,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
         });
 
         let result = validate_custom_credential("test", &cred);
@@ -6342,6 +6470,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
         });
 
         assert!(validate_custom_credential("test", &cred).is_ok());
@@ -6358,6 +6487,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
         });
 
         assert!(validate_custom_credential("test", &cred).is_ok());
@@ -6503,6 +6633,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -7457,6 +7588,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -7484,6 +7616,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -7648,6 +7781,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -7675,6 +7809,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -9895,6 +10030,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
@@ -9925,6 +10061,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
@@ -9958,6 +10095,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
@@ -9991,6 +10129,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
@@ -10056,6 +10195,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
@@ -10550,6 +10690,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
@@ -11361,6 +11502,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],

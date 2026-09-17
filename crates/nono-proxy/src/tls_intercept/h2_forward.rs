@@ -356,6 +356,15 @@ async fn handle_h2_stream(
         None
     };
 
+    if cred.is_some_and(|c| c.inject_mode == InjectMode::JsonBody) {
+        warn!(
+            "h2_forward: json_body credential route matched for {} {}, but h2 body rewrite is not implemented; failing closed",
+            method, path
+        );
+        send_h2_error(&mut respond, 501)?;
+        return Ok(());
+    }
+
     // Build transformed path (credential injection into path/query if needed).
     // Shared with the HTTP/1.1 path so URL-mode injection cannot diverge.
     let transformed_path = reverse::transform_path_for_credential(cred, &path)?;
@@ -777,6 +786,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![EndpointRule {
@@ -860,6 +870,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: rules,
@@ -894,6 +905,8 @@ mod tests {
                 path_replacement: None,
                 query_param_name: None,
                 proxy_query_param_name: None,
+                body_field: None,
+                proxy_body_field: None,
             },
         );
         store
@@ -925,6 +938,8 @@ mod tests {
                 path_replacement: None,
                 query_param_name: None,
                 proxy_query_param_name: None,
+                body_field: None,
+                proxy_body_field: None,
             },
         );
         store
@@ -1186,6 +1201,113 @@ mod tests {
         })
         .await;
         assert!(result.is_ok(), "test timed out — h2 forwarding hung");
+    }
+
+    #[tokio::test]
+    async fn h2_forward_fails_closed_for_json_body_route() {
+        use std::time::Duration;
+
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (upstream_port, rx) = spawn_mock_h2_upstream(&ca).await;
+
+        let route_store = make_route_store(
+            "localhost",
+            upstream_port,
+            vec![EndpointRule {
+                method: "*".to_string(),
+                path: "/**".to_string(),
+            }],
+        )
+        .await;
+        let mut credential_store = CredentialStore::empty();
+        credential_store.insert_for_test(
+            "test-svc".to_string(),
+            LoadedCredential {
+                inject_mode: InjectMode::JsonBody,
+                proxy_inject_mode: InjectMode::JsonBody,
+                raw_credential: Zeroizing::new("real-secret".to_string()),
+                header_name: "Authorization".to_string(),
+                proxy_header_name: "Authorization".to_string(),
+                header_value: Zeroizing::new(String::new()),
+                extra_headers: Vec::new(),
+                path_pattern: None,
+                proxy_path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy_query_param_name: None,
+                body_field: Some("data.TOKEN".to_string()),
+                proxy_body_field: None,
+            },
+        );
+        let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+
+        let ctx = InterceptCtx {
+            route_id: Some("test-svc"),
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
+            session_token: &session_token,
+            cert_cache,
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: true,
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (mut h2_client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+                    let conn_handle = tokio::spawn(async move {
+                        let _ = h2_conn.await;
+                    });
+                    let request = http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "https://localhost:{}/session/v1/login-request",
+                            upstream_port
+                        ))
+                        .header("content-type", "application/json")
+                        .body(())
+                        .unwrap();
+                    let (response_fut, mut send_stream) =
+                        h2_client.send_request(request, false).unwrap();
+                    send_stream
+                        .send_data(Bytes::from(r#"{"data":{"TOKEN":"session-tok"}}"#), true)
+                        .unwrap();
+                    let response = response_fut.await.unwrap();
+                    assert_eq!(response.status(), 501);
+
+                    // The phantom must never travel upstream over h2.
+                    let upstream_saw_request =
+                        tokio::time::timeout(Duration::from_millis(200), rx).await;
+                    assert!(
+                        upstream_saw_request.is_err(),
+                        "json_body stream must not be forwarded"
+                    );
+
+                    drop(h2_client);
+                    conn_handle.abort();
+                    let _ = conn_handle.await;
+                }
+            );
+        })
+        .await;
+        assert!(result.is_ok(), "test timed out");
     }
 
     #[tokio::test]
@@ -1665,6 +1787,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![EndpointRule {
@@ -2061,6 +2184,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![EndpointRule {
@@ -2088,6 +2212,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![EndpointRule {
@@ -2270,6 +2395,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: rules,
@@ -2399,6 +2525,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: Vec::new(),
@@ -2607,6 +2734,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -2632,6 +2760,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![

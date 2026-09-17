@@ -22,6 +22,11 @@ pub enum InjectMode {
     QueryParam,
     /// Use HTTP Basic Authentication (credential format: "username:password")
     BasicAuth,
+    /// Replace a field of a JSON request body with the credential.
+    ///
+    /// For protocols that carry the credential in the request payload instead
+    /// of a header. Requires TLS interception and HTTP/1.1; HTTP/2 fails closed.
+    JsonBody,
 }
 
 /// Configuration for the proxy server.
@@ -791,6 +796,12 @@ pub struct RouteConfig {
     #[serde(default)]
     pub query_param_name: Option<String>,
 
+    // --- JSON body mode fields ---
+    /// Dotted path of the JSON body field that carries the credential
+    /// (e.g. "data.TOKEN"). Only used when inject_mode is "json_body".
+    #[serde(default)]
+    pub body_field: Option<String>,
+
     /// Optional overrides for proxy-side phantom token handling.
     ///
     /// When set, these values are used to validate the incoming phantom token
@@ -1001,6 +1012,10 @@ pub struct ProxyInjectConfig {
     /// Optional query parameter override for query_param mode.
     #[serde(default)]
     pub query_param_name: Option<String>,
+
+    /// Optional JSON body field override for json_body mode.
+    #[serde(default)]
+    pub body_field: Option<String>,
 }
 
 /// An HTTP method+path access rule for reverse proxy endpoint filtering.
