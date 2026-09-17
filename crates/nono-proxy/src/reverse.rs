@@ -47,6 +47,7 @@ pub(crate) fn auth_mechanism_for_inject_mode(
         }
         InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
         InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+        InjectMode::JsonBody => nono::undo::NetworkAuditAuthMechanism::PhantomBody,
     }
 }
 
@@ -58,6 +59,7 @@ pub(crate) fn audit_injection_mode_for_inject_mode(
         InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
         InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
         InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+        InjectMode::JsonBody => nono::undo::NetworkAuditInjectionMode::JsonBody,
     }
 }
 
@@ -2421,6 +2423,12 @@ pub(crate) fn validate_phantom_token_for_mode(
             })?;
             validate_phantom_token_in_query(path, param_name, session_token)
         }
+        // The phantom lives in the body, which this header-only check never
+        // sees. json_body routes are served by the TLS-intercept path.
+        InjectMode::JsonBody => {
+            warn!("json_body routes are not served by the reverse proxy path");
+            Err(ProxyError::InvalidToken)
+        }
     }
 }
 
@@ -2515,7 +2523,7 @@ pub(crate) fn transform_path_for_mode(
     credential: &Zeroizing<String>,
 ) -> Result<String> {
     match mode {
-        InjectMode::Header | InjectMode::BasicAuth => {
+        InjectMode::Header | InjectMode::BasicAuth | InjectMode::JsonBody => {
             // No path transformation needed
             Ok(path.to_string())
         }
@@ -2685,8 +2693,8 @@ pub(crate) fn strip_proxy_artifacts(
                 path.to_string()
             }
         }
-        // Header and BasicAuth modes don't embed artifacts in the URL path.
-        InjectMode::Header | InjectMode::BasicAuth => path.to_string(),
+        // Header, BasicAuth and JsonBody modes don't embed artifacts in the URL path.
+        InjectMode::Header | InjectMode::BasicAuth | InjectMode::JsonBody => path.to_string(),
     }
 }
 
@@ -2797,7 +2805,7 @@ fn inject_credential_structured(
             }
             builder
         }
-        InjectMode::UrlPath | InjectMode::QueryParam => builder,
+        InjectMode::UrlPath | InjectMode::QueryParam | InjectMode::JsonBody => builder,
     }
 }
 
@@ -2847,8 +2855,8 @@ pub(crate) fn inject_credential_for_mode(cred: &LoadedCredential, request: &mut 
                 request.push_str(&format!("{}: {}\r\n", name, value.as_str()));
             }
         }
-        InjectMode::UrlPath | InjectMode::QueryParam => {
-            // Credential is already injected into the URL path/query
+        InjectMode::UrlPath | InjectMode::QueryParam | InjectMode::JsonBody => {
+            // Credential goes into the URL path/query or the body.
             // No header injection needed
         }
     }
@@ -2862,6 +2870,149 @@ pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) 
             names
         })
         .unwrap_or_default()
+}
+
+/// Replace the phantom carried in the JSON body field of a `json_body` route
+/// with the real credential.
+///
+/// The upstream protocol decides which requests carry the credential: a body
+/// without the field is forwarded unchanged so follow-up requests that
+/// authenticate with an upstream-issued session token keep working. A field
+/// that holds anything but the phantom, a non-JSON body that contains the
+/// phantom, or phantom bytes left anywhere after the rewrite all fail closed.
+pub(crate) fn inject_credential_into_json_body(
+    cred: &LoadedCredential,
+    body: &[u8],
+    session_token: &Zeroizing<String>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let inject_field = cred
+        .body_field
+        .as_deref()
+        .ok_or_else(|| ProxyError::HttpParse("json_body mode requires body_field".to_string()))?;
+    let proxy_field = cred.proxy_body_field.as_deref().unwrap_or(inject_field);
+
+    if body.is_empty() {
+        return Ok(Zeroizing::new(Vec::new()));
+    }
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        if contains_bytes(body, session_token.as_bytes()) {
+            warn!("Phantom token in a non-JSON body of a json_body route");
+            return Err(ProxyError::InvalidToken);
+        }
+        return Ok(Zeroizing::new(body.to_vec()));
+    };
+
+    let out = match json_value_at_path(&json, proxy_field) {
+        None => Zeroizing::new(body.to_vec()),
+        Some(serde_json::Value::String(presented))
+            if token::constant_time_eq(presented.as_bytes(), session_token.as_bytes()) =>
+        {
+            if proxy_field != inject_field {
+                json_remove_at_path(&mut json, proxy_field);
+            }
+            json_set_at_path(
+                &mut json,
+                inject_field,
+                serde_json::Value::String(cred.raw_credential.to_string()),
+            )?;
+            Zeroizing::new(serde_json::to_vec(&json).map_err(|e| {
+                ProxyError::HttpParse(format!("failed to encode rewritten JSON body: {e}"))
+            })?)
+        }
+        Some(_) => {
+            warn!("Invalid phantom token in JSON body field '{}'", proxy_field);
+            return Err(ProxyError::InvalidToken);
+        }
+    };
+    drop(json);
+
+    if contains_bytes(&out, session_token.as_bytes()) {
+        warn!(
+            "Phantom token outside body field '{}' of a json_body route",
+            proxy_field
+        );
+        return Err(ProxyError::InvalidToken);
+    }
+    Ok(out)
+}
+
+/// For json_body routes, also honour the phantom when a client sends it in
+/// the configured header instead of the body, so one route can serve both a
+/// driver protocol (body) and a REST API (`Authorization: Bearer`) on the
+/// same host. A header without the phantom is left untouched.
+pub(crate) fn swap_phantom_in_header(
+    cred: &LoadedCredential,
+    headers: &mut [(String, String)],
+    session_token: &Zeroizing<String>,
+) {
+    for (name, value) in headers.iter_mut() {
+        if name.eq_ignore_ascii_case(&cred.proxy_header_name)
+            && contains_bytes(value.as_bytes(), session_token.as_bytes())
+        {
+            *value = cred.header_value.to_string();
+        }
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn json_value_at_path<'a>(
+    root: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = root;
+    for part in path.split('.') {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
+
+fn json_remove_at_path(root: &mut serde_json::Value, path: &str) {
+    let Some((parent_path, last)) = path.rsplit_once('.') else {
+        if let Some(obj) = root.as_object_mut() {
+            obj.remove(path);
+        }
+        return;
+    };
+    let mut current = root;
+    for part in parent_path.split('.') {
+        let Some(next) = current.as_object_mut().and_then(|o| o.get_mut(part)) else {
+            return;
+        };
+        current = next;
+    }
+    if let Some(obj) = current.as_object_mut() {
+        obj.remove(last);
+    }
+}
+
+/// Set `path` to `value`, creating intermediate objects. Fails when a segment
+/// on the way is present but is not an object, so a credential never lands in
+/// an unexpected shape.
+fn json_set_at_path(
+    root: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<()> {
+    let mut current = root;
+    let mut parts = path.split('.').peekable();
+    while let Some(part) = parts.next() {
+        let obj = current.as_object_mut().ok_or_else(|| {
+            ProxyError::HttpParse(format!(
+                "body_field '{path}': '{part}' is not inside an object"
+            ))
+        })?;
+        if parts.peek().is_none() {
+            obj.insert(part.to_string(), value);
+            return Ok(());
+        }
+        current = obj
+            .entry(part.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3195,6 +3346,203 @@ mod tests {
         assert_eq!(filtered[0].0, "Content-Type");
     }
 
+    fn json_body_cred(body_field: &str, proxy_body_field: Option<&str>) -> LoadedCredential {
+        LoadedCredential {
+            inject_mode: InjectMode::JsonBody,
+            proxy_inject_mode: InjectMode::JsonBody,
+            raw_credential: Zeroizing::new("real-secret".to_string()),
+            header_name: "Authorization".to_string(),
+            proxy_header_name: "Authorization".to_string(),
+            header_value: Zeroizing::new(String::new()),
+            extra_headers: Vec::new(),
+            path_pattern: None,
+            proxy_path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy_query_param_name: None,
+            body_field: Some(body_field.to_string()),
+            proxy_body_field: proxy_body_field.map(str::to_string),
+        }
+    }
+
+    fn phantom() -> Zeroizing<String> {
+        Zeroizing::new("nono_phantom_token".to_string())
+    }
+
+    #[test]
+    fn json_body_replaces_phantom_in_nested_field() {
+        let cred = json_body_cred("data.TOKEN", None);
+        let body = br#"{"data":{"AUTHENTICATOR":"OAUTH","TOKEN":"nono_phantom_token"},"x":1}"#;
+        let out = inject_credential_into_json_body(&cred, body, &phantom()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["data"]["TOKEN"], "real-secret");
+        assert_eq!(json["data"]["AUTHENTICATOR"], "OAUTH");
+        assert_eq!(json["x"], 1);
+        assert!(!contains_bytes(&out, b"nono_phantom_token"));
+    }
+
+    #[test]
+    fn json_body_passes_through_body_without_field() {
+        let cred = json_body_cred("data.TOKEN", None);
+        let body = br#"{"sqlText":"select 1","data":{"other":"v"}}"#;
+        let out = inject_credential_into_json_body(&cred, body, &phantom()).unwrap();
+        assert_eq!(&*out, body);
+    }
+
+    #[test]
+    fn json_body_passes_through_empty_and_non_json_bodies() {
+        let cred = json_body_cred("data.TOKEN", None);
+        assert!(
+            inject_credential_into_json_body(&cred, b"", &phantom())
+                .unwrap()
+                .is_empty()
+        );
+        let form = b"a=1&b=2";
+        let out = inject_credential_into_json_body(&cred, form, &phantom()).unwrap();
+        assert_eq!(&*out, form);
+    }
+
+    #[test]
+    fn json_body_rejects_wrong_value_in_field() {
+        let cred = json_body_cred("data.TOKEN", None);
+        let body = br#"{"data":{"TOKEN":"someone-elses-token"}}"#;
+        let err = inject_credential_into_json_body(&cred, body, &phantom()).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidToken));
+    }
+
+    #[test]
+    fn json_body_rejects_non_string_field() {
+        let cred = json_body_cred("data.TOKEN", None);
+        let body = br#"{"data":{"TOKEN":["nono_phantom_token"]}}"#;
+        let err = inject_credential_into_json_body(&cred, body, &phantom()).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidToken));
+    }
+
+    #[test]
+    fn json_body_rejects_phantom_outside_field() {
+        let cred = json_body_cred("data.TOKEN", None);
+        let elsewhere = br#"{"data":{"PASSWORD":"nono_phantom_token"}}"#;
+        let err = inject_credential_into_json_body(&cred, elsewhere, &phantom()).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidToken));
+
+        let both = br#"{"data":{"TOKEN":"nono_phantom_token","PASSWORD":"nono_phantom_token"}}"#;
+        let err = inject_credential_into_json_body(&cred, both, &phantom()).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidToken));
+
+        let non_json = b"token=nono_phantom_token";
+        let err = inject_credential_into_json_body(&cred, non_json, &phantom()).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidToken));
+    }
+
+    #[test]
+    fn json_body_rejects_phantom_prefix_and_suffix_variants() {
+        let cred = json_body_cred("data.TOKEN", None);
+        for value in [
+            "nono_phantom_toke",
+            "nono_phantom_tokenX",
+            "",
+            "Bearer nono_phantom_token",
+        ] {
+            let body = format!(r#"{{"data":{{"TOKEN":"{value}"}}}}"#);
+            let result = inject_credential_into_json_body(&cred, body.as_bytes(), &phantom());
+            assert!(result.is_err(), "value {value:?} must not be accepted");
+        }
+    }
+
+    #[test]
+    fn json_body_top_level_field_and_dotted_key_are_distinct() {
+        let cred = json_body_cred("token", None);
+        let body = br#"{"token":"nono_phantom_token"}"#;
+        let out = inject_credential_into_json_body(&cred, body, &phantom()).unwrap();
+        assert_eq!(&*out, br#"{"token":"real-secret"}"#);
+
+        // A literal key containing a dot is not the nested path.
+        let cred = json_body_cred("data.TOKEN", None);
+        let body = br#"{"data.TOKEN":"nono_phantom_token"}"#;
+        let err = inject_credential_into_json_body(&cred, body, &phantom()).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidToken));
+    }
+
+    #[test]
+    fn json_body_proxy_field_override_moves_credential() {
+        let cred = json_body_cred("data.TOKEN", Some("nono_phantom"));
+        let body = br#"{"nono_phantom":"nono_phantom_token","data":{"AUTHENTICATOR":"OAUTH"}}"#;
+        let out = inject_credential_into_json_body(&cred, body, &phantom()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(json.get("nono_phantom").is_none());
+        assert_eq!(json["data"]["TOKEN"], "real-secret");
+        assert_eq!(json["data"]["AUTHENTICATOR"], "OAUTH");
+    }
+
+    #[test]
+    fn json_body_proxy_field_override_creates_missing_parent() {
+        let cred = json_body_cred("data.TOKEN", Some("phantom"));
+        let body = br#"{"phantom":"nono_phantom_token"}"#;
+        let out = inject_credential_into_json_body(&cred, body, &phantom()).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["data"]["TOKEN"], "real-secret");
+    }
+
+    #[test]
+    fn json_body_refuses_to_inject_through_non_object_segment() {
+        let cred = json_body_cred("data.TOKEN", Some("phantom"));
+        let body = br#"{"phantom":"nono_phantom_token","data":"scalar"}"#;
+        let err = inject_credential_into_json_body(&cred, body, &phantom()).unwrap_err();
+        assert!(matches!(err, ProxyError::HttpParse(_)));
+    }
+
+    #[test]
+    fn json_body_swaps_phantom_only_in_matching_header() {
+        let mut cred = json_body_cred("data.TOKEN", None);
+        cred.header_value = Zeroizing::new("Bearer real-secret".to_string());
+        let mut headers = vec![
+            (
+                "authorization".to_string(),
+                "Bearer nono_phantom_token".to_string(),
+            ),
+            ("X-Other".to_string(), "nono_phantom_token".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ];
+        swap_phantom_in_header(&cred, &mut headers, &phantom());
+        assert_eq!(headers[0].1, "Bearer real-secret");
+        assert_eq!(headers[1].1, "nono_phantom_token");
+        assert_eq!(headers[2].1, "application/json");
+
+        let mut session = vec![(
+            "Authorization".to_string(),
+            "Snowflake Token=\"abc\"".to_string(),
+        )];
+        swap_phantom_in_header(&cred, &mut session, &phantom());
+        assert_eq!(session[0].1, "Snowflake Token=\"abc\"");
+    }
+
+    #[test]
+    fn json_body_mode_never_touches_headers_or_path() {
+        let cred = json_body_cred("data.TOKEN", None);
+        assert!(injected_credential_header_names(Some(&cred)).is_empty());
+        let mut request = Zeroizing::new(String::new());
+        inject_credential_for_mode(&cred, &mut request);
+        assert!(request.is_empty());
+        assert_eq!(
+            transform_path_for_credential(Some(&cred), "/session/v1/login-request?x=1").unwrap(),
+            "/session/v1/login-request?x=1"
+        );
+    }
+
+    #[test]
+    fn json_body_mode_fails_closed_on_reverse_path() {
+        let result = validate_phantom_token_for_mode(
+            &InjectMode::JsonBody,
+            b"Authorization: Bearer nono_phantom_token\r\n",
+            "/x",
+            "Authorization",
+            None,
+            None,
+            &phantom(),
+        );
+        assert!(matches!(result, Err(ProxyError::InvalidToken)));
+    }
+
     #[test]
     fn test_injected_credential_header_names_include_extra_headers() {
         let cred = LoadedCredential {
@@ -3213,6 +3561,8 @@ mod tests {
             path_replacement: None,
             query_param_name: None,
             proxy_query_param_name: None,
+            body_field: None,
+            proxy_body_field: None,
         };
 
         let names = injected_credential_header_names(Some(&cred));
@@ -3244,6 +3594,8 @@ mod tests {
             path_replacement: None,
             query_param_name: None,
             proxy_query_param_name: None,
+            body_field: None,
+            proxy_body_field: None,
         };
 
         let builder = http::Request::builder().method("POST").uri("https://x/y");
@@ -3286,6 +3638,8 @@ mod tests {
             path_replacement: None,
             query_param_name: None,
             proxy_query_param_name: None,
+            body_field: None,
+            proxy_body_field: None,
         };
 
         let builder = http::Request::builder().method("POST").uri("https://x/y");

@@ -3245,6 +3245,9 @@ fn resolve_to_manifest(
             profile::InjectMode::UrlPath => manifest::InjectMode::UrlPath,
             profile::InjectMode::QueryParam => manifest::InjectMode::QueryParam,
             profile::InjectMode::BasicAuth => manifest::InjectMode::BasicAuth,
+            // OAuth2 above and json_body here share the same gap: the manifest
+            // schema has no shape for them, so the export skips the route.
+            profile::InjectMode::JsonBody => continue,
         };
 
         let endpoint_rules: Vec<manifest::EndpointRule> = cred

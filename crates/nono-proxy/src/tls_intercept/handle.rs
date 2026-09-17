@@ -14,7 +14,7 @@
 use crate::audit;
 use crate::capture::CredentialCaptureBackend;
 use crate::config::EndpointPolicyOutcome;
-use crate::credential::CredentialStore;
+use crate::credential::{CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
 use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
@@ -1025,6 +1025,26 @@ pub(crate) async fn resolve_managed_credential<'a>(
     }
 }
 
+/// Content-Encoding on a json_body request cannot be rewritten without
+/// decoding, so it is refused rather than forwarded with the phantom intact.
+fn inject_json_body_credential(
+    cred: &LoadedCredential,
+    headers: &[(String, String)],
+    body: &[u8],
+    session_token: &Zeroizing<String>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let encoded = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-encoding")
+            && !value.trim().eq_ignore_ascii_case("identity")
+    });
+    if encoded {
+        return Err(ProxyError::HttpParse(
+            "json_body credential injection does not support Content-Encoding".to_string(),
+        ));
+    }
+    reverse::inject_credential_into_json_body(cred, body, session_token)
+}
+
 /// Read one inner HTTP/1.1 request, select the matching route, inject
 /// credentials if matched, and forward upstream.
 async fn handle_inner_request<S>(tls_stream: &mut S, ctx: &InterceptCtx<'_>) -> Result<()>
@@ -1228,7 +1248,12 @@ where
 
     // --- Read body (Content-Length only; chunked is rare in API requests
     // and matches the existing reverse-proxy contract). ---
-    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
+    // json_body routes own a body field, not a header: the client's own auth
+    // header (e.g. an upstream-issued session token) must survive.
+    let strip_header = cred
+        .filter(|c| c.inject_mode != crate::config::InjectMode::JsonBody)
+        .map(|c| c.proxy_header_name.as_str())
+        .unwrap_or("");
     let mut filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
     if is_oauth_capture_host {
         filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
@@ -1244,6 +1269,38 @@ where
             .rewrite_request_body(endpoint, &body)?
     } else {
         body
+    };
+    let body = match cred {
+        Some(cred) if cred.inject_mode == crate::config::InjectMode::JsonBody => {
+            reverse::swap_phantom_in_header(cred, &mut filtered_headers, ctx.session_token);
+            match inject_json_body_credential(cred, &filtered_headers, &body, ctx.session_token) {
+                Ok(rewritten) => rewritten,
+                Err(e) => {
+                    audit::log_denied(
+                        ctx.audit_log,
+                        audit::ProxyMode::ConnectIntercept,
+                        &audit::EventContext {
+                            route_id: service,
+                            auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                            denial_category: Some(
+                                nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                            ),
+                            ..audit::EventContext::default()
+                        },
+                        ctx.host,
+                        ctx.port,
+                        &e.to_string(),
+                    );
+                    let (status, msg) = match e {
+                        ProxyError::InvalidToken => (401, "Unauthorized"),
+                        _ => (400, "Bad Request"),
+                    };
+                    reverse::send_error_generic(tls_stream, status, msg).await?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => Zeroizing::new(body),
     };
 
     // --- Build upstream request bytes ---
@@ -2568,6 +2625,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![crate::config::EndpointRule {
@@ -2605,6 +2663,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
@@ -2694,6 +2753,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
@@ -2753,6 +2813,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![crate::config::EndpointRule {
@@ -2851,6 +2912,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -3460,6 +3522,317 @@ mod tests {
             nonce_resolver: None,
             enable_h2: false,
         }
+    }
+
+    // --- json_body end-to-end over the HTTP/1.1 intercept path ---
+
+    fn http1_tls_connector_trusting(ca_pem: &str) -> tokio_rustls::TlsConnector {
+        use rustls::pki_types::pem::PemObject;
+
+        let mut roots = rustls::RootCertStore::empty();
+        let cert = rustls::pki_types::CertificateDer::from_pem_slice(ca_pem.as_bytes()).unwrap();
+        roots.add(cert).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    fn http1_upstream_server_config(
+        ca: &crate::tls_intercept::ca::EphemeralCa,
+    ) -> Arc<rustls::server::ServerConfig> {
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use time::OffsetDateTime;
+
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.not_before = OffsetDateTime::now_utc();
+        params.not_after = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.signed_by(&key_pair, ca.issuer()).unwrap();
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let config = rustls::server::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], private_key)
+        .unwrap();
+        Arc::new(config)
+    }
+
+    /// One-shot HTTP/1.1 TLS upstream. Sends back what it saw: the request
+    /// head and the body bytes, exactly as forwarded by the proxy.
+    async fn spawn_mock_http1_upstream(
+        ca: &crate::tls_intercept::ca::EphemeralCa,
+    ) -> (u16, tokio::sync::oneshot::Receiver<(String, Vec<u8>)>) {
+        use tokio::io::AsyncReadExt;
+
+        let server_config = http1_upstream_server_config(ca);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = TlsAcceptor::from(server_config).accept(tcp).await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                let n = tls.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break None;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(pos + 4);
+                }
+            };
+            let head_end = head_end.unwrap();
+            let head = String::from_utf8(raw[..head_end].to_vec()).unwrap();
+            let content_length = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while raw.len() < head_end + content_length {
+                let n = tls.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let body = raw[head_end..].to_vec();
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            tls.shutdown().await.ok();
+            let _ = tx.send((head, body));
+        });
+        (port, rx)
+    }
+
+    /// Drive one inner request through `handle_inner_request` against a
+    /// json_body route. Returns the raw client response and whatever the
+    /// upstream received (None when the proxy never forwarded).
+    async fn run_json_body_request(
+        body_field: &str,
+        request: &str,
+    ) -> (String, Option<(String, Vec<u8>)>) {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let (upstream_port, upstream_rx) = spawn_mock_http1_upstream(&ca).await;
+
+        let route: crate::config::RouteConfig = serde_json::from_value(serde_json::json!({
+            "prefix": "snow",
+            "upstream": format!("https://localhost:{upstream_port}"),
+            "credential_key": "unused_in_test",
+            "inject_mode": "json_body",
+            "body_field": body_field,
+            "endpoint_rules": [{"method": "POST", "path": "/session/v1/login-request"}, {"method": "POST", "path": "/queries/v1/query-request"}, {"method": "POST", "path": "/api/v2/statements"}]
+        }))
+        .unwrap();
+        let route_store = RouteStore::load(&[route]).await.unwrap();
+        let mut credential_store = CredentialStore::empty();
+        credential_store.insert_for_test(
+            "snow".to_string(),
+            LoadedCredential {
+                inject_mode: crate::config::InjectMode::JsonBody,
+                proxy_inject_mode: crate::config::InjectMode::JsonBody,
+                raw_credential: Zeroizing::new("real-pat-secret".to_string()),
+                header_name: "Authorization".to_string(),
+                proxy_header_name: "Authorization".to_string(),
+                header_value: Zeroizing::new("Bearer real-pat-secret".to_string()),
+                extra_headers: Vec::new(),
+                path_pattern: None,
+                proxy_path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy_query_param_name: None,
+                body_field: Some(body_field.to_string()),
+                proxy_body_field: None,
+            },
+        );
+        let tls_connector = http1_tls_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = InterceptCtx {
+            route_id: Some("snow"),
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(OAuthCaptureStore::empty()),
+            session_token: &session_token,
+            cert_cache: Arc::new(CertCache::new(Arc::clone(&ca))),
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: false,
+        };
+
+        let (mut client_side, mut proxy_side) = tokio::io::duplex(65536);
+        let request = request.to_string();
+        let (proxy_result, client_response) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let r = handle_inner_request(&mut proxy_side, &ctx).await;
+                    drop(proxy_side);
+                    r
+                },
+                async {
+                    client_side.write_all(request.as_bytes()).await.unwrap();
+                    client_side.flush().await.unwrap();
+                    let mut out = Vec::new();
+                    client_side.read_to_end(&mut out).await.unwrap();
+                    String::from_utf8_lossy(&out).into_owned()
+                }
+            )
+        })
+        .await
+        .expect("intercept round trip hung");
+        proxy_result.unwrap();
+        let upstream_seen = tokio::time::timeout(Duration::from_millis(300), upstream_rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        (client_response, upstream_seen)
+    }
+
+    fn json_post(path: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn json_body_intercept_swaps_phantom_for_real_credential() {
+        let body = r#"{"data":{"AUTHENTICATOR":"OAUTH","TOKEN":"session-tok","LOGIN_NAME":"me"}}"#;
+        let (response, upstream) = run_json_body_request(
+            "data.TOKEN",
+            &json_post("/session/v1/login-request", "", body),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let (head, forwarded) = upstream.expect("upstream must receive the login request");
+        let json: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
+        assert_eq!(json["data"]["TOKEN"], "real-pat-secret");
+        assert_eq!(json["data"]["LOGIN_NAME"], "me");
+        assert!(!forwarded.windows(11).any(|w| w == b"session-tok"));
+        // Content-Length must describe the rewritten body, not the original.
+        assert!(
+            head.contains(&format!("Content-Length: {}\r\n", forwarded.len())),
+            "{head}"
+        );
+        assert!(
+            !head.to_ascii_lowercase().contains("authorization:"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_body_intercept_forwards_session_requests_untouched() {
+        // Follow-up Snowflake requests carry no TOKEN field and authenticate
+        // with an upstream-issued session token header instead.
+        let body = r#"{"sqlText":"select 1","sequenceId":1}"#;
+        let (response, upstream) = run_json_body_request(
+            "data.TOKEN",
+            &json_post(
+                "/queries/v1/query-request",
+                "Authorization: Snowflake Token=\"upstream-session\"\r\n",
+                body,
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (head, forwarded) = upstream.expect("upstream must receive the query");
+        assert_eq!(forwarded, body.as_bytes());
+        assert!(
+            head.contains("Authorization: Snowflake Token=\"upstream-session\""),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_body_intercept_also_swaps_phantom_in_auth_header() {
+        // Same host, REST API path: the phantom arrives as a bearer header.
+        let body = r#"{"statement":"select 1"}"#;
+        let (response, upstream) = run_json_body_request(
+            "data.TOKEN",
+            &json_post(
+                "/api/v2/statements",
+                "Authorization: Bearer session-tok\r\n",
+                body,
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (head, forwarded) = upstream.expect("upstream must receive the statement");
+        assert_eq!(forwarded, body.as_bytes());
+        assert!(
+            head.contains("Authorization: Bearer real-pat-secret\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("session-tok"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn json_body_intercept_rejects_foreign_token_without_forwarding() {
+        let body = r#"{"data":{"TOKEN":"not-the-phantom"}}"#;
+        let (response, upstream) = run_json_body_request(
+            "data.TOKEN",
+            &json_post("/session/v1/login-request", "", body),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(
+            upstream.is_none(),
+            "nothing may reach upstream on a rejected login"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_body_intercept_rejects_phantom_smuggled_in_other_field() {
+        let body = r#"{"data":{"TOKEN":"session-tok","PASSWORD":"session-tok"}}"#;
+        let (response, upstream) = run_json_body_request(
+            "data.TOKEN",
+            &json_post("/session/v1/login-request", "", body),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(upstream.is_none());
+    }
+
+    #[tokio::test]
+    async fn json_body_intercept_rejects_compressed_bodies() {
+        let body = r#"{"data":{"TOKEN":"session-tok"}}"#;
+        let (response, upstream) = run_json_body_request(
+            "data.TOKEN",
+            &json_post(
+                "/session/v1/login-request",
+                "Content-Encoding: gzip\r\n",
+                body,
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(upstream.is_none());
     }
 
     #[tokio::test]

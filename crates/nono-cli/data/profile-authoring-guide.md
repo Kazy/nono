@@ -506,12 +506,13 @@ An individual entry in the `custom_credentials` map is configured as follows:
 |---------------------|-----------------|-------------|-------------|
 | `upstream`          | string          | yes         | Upstream URL. Must be HTTPS (HTTP only for loopback). |
 | `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `bw://` URI, `apple-password://` URI, `keyring://` URI, `file://` URI, `env://` URI, or `cmd://` URI referencing `credential_capture`. |
-| `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
+| `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`, `"json_body"`. |
 | `inject_header`     | string          | header mode | HTTP header name. Default: `"Authorization"`. |
 | `credential_format` | string          | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
 | `path_pattern`      | string          | url_path    | Pattern to match in URL path. Use `{}` for placeholder. |
 | `path_replacement`  | string          | url_path    | Replacement pattern. Defaults to `path_pattern`. |
 | `query_param_name`  | string          | query_param | Query parameter name for credential injection. |
+| `body_field`        | string          | json_body   | Dotted path of the JSON body field that carries the credential (e.g. `"data.TOKEN"`). The field is replaced when it holds the phantom, a body without the field is forwarded unchanged, and any other value is rejected. A phantom in `inject_header` is replaced too. HTTP/1.1 only; compressed bodies are rejected. |
 | `proxy`             | object          | no          | Optional proxy-side overrides for phantom token parsing. Omitted fields inherit from top-level values. |
 | `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is `op://`, `bw://`, `apple-password://`, `keyring://`, `file://`, or `cmd://`. Optional for `env://`. |
 | `endpoint_rules`    | array           | no          | L7 allow-list of `{"method": "GET", "path": "/**"}` rules. When non-empty, only matching requests are forwarded (default-deny). |

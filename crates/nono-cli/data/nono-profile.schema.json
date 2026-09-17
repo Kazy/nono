@@ -1128,6 +1128,13 @@
           ],
           "description": "Name of the query parameter to add or replace with the credential. Required when inject_mode is \"query_param\"."
         },
+        "body_field": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Dotted path of the JSON body field that carries the credential (e.g. \"data.TOKEN\"). Required when inject_mode is \"json_body\"."
+        },
         "proxy": {
           "oneOf": [
             { "$ref": "#/$defs/ProxyInjectConfig" },
@@ -1229,7 +1236,7 @@
     },
     "InjectMode": {
       "type": "string",
-      "enum": ["header", "url_path", "query_param", "basic_auth"],
+      "enum": ["header", "url_path", "query_param", "basic_auth", "json_body"],
       "description": "Credential injection mode for the reverse proxy.",
       "default": "header"
     },
@@ -1279,6 +1286,13 @@
             { "type": "null" }
           ],
           "description": "Override query parameter name for proxy-side query_param mode. Falls back to parent query_param_name when omitted."
+        },
+        "body_field": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override JSON body field for proxy-side json_body mode. Falls back to parent body_field when omitted."
         }
       }
     },

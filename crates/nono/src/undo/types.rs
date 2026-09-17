@@ -218,6 +218,8 @@ pub enum NetworkAuditAuthMechanism {
     PhantomPath,
     /// Phantom token carried in a query parameter
     PhantomQuery,
+    /// Phantom token carried in a JSON request body field
+    PhantomBody,
     /// SPIFFE JWT-SVID injected as a bearer token directly into an upstream request header
     SpiffeJwtBearer,
     /// SPIFFE JWT-SVID used as an OAuth2 `client_assertion` (RFC 7523) to exchange
@@ -243,6 +245,7 @@ pub enum NetworkAuditInjectionMode {
     UrlPath,
     QueryParam,
     BasicAuth,
+    JsonBody,
     OAuth2,
     /// SPIFFE JWT-SVID injected directly as a bearer header value
     SpiffeJwt,

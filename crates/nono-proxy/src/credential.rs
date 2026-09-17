@@ -58,6 +58,12 @@ pub struct LoadedCredential {
     pub query_param_name: Option<String>,
     /// Proxy-side query parameter name for phantom token validation.
     pub proxy_query_param_name: Option<String>,
+
+    // --- JSON body mode ---
+    /// Dotted path of the JSON body field to carry the credential upstream.
+    pub body_field: Option<String>,
+    /// Proxy-side JSON body field for phantom token validation.
+    pub proxy_body_field: Option<String>,
 }
 
 /// Metadata for a command-backed credential route. The actual secret is
@@ -76,6 +82,8 @@ pub struct CmdCredentialRoute {
     pub path_replacement: Option<String>,
     pub query_param_name: Option<String>,
     pub proxy_query_param_name: Option<String>,
+    pub body_field: Option<String>,
+    pub proxy_body_field: Option<String>,
 }
 
 impl CmdCredentialRoute {
@@ -87,7 +95,9 @@ impl CmdCredentialRoute {
         let (raw_credential, header_value, extra_headers) = match material {
             CredentialCaptureMaterial::Secret(secret) => {
                 let header_value = match self.inject_mode {
-                    InjectMode::Header => Zeroizing::new(effective_format.replace("{}", &secret)),
+                    InjectMode::Header | InjectMode::JsonBody => {
+                        Zeroizing::new(effective_format.replace("{}", &secret))
+                    }
                     InjectMode::BasicAuth => {
                         let encoded =
                             base64::engine::general_purpose::STANDARD.encode(secret.as_bytes());
@@ -117,6 +127,8 @@ impl CmdCredentialRoute {
             path_replacement: self.path_replacement.clone(),
             query_param_name: self.query_param_name.clone(),
             proxy_query_param_name: self.proxy_query_param_name.clone(),
+            body_field: self.body_field.clone(),
+            proxy_body_field: self.proxy_body_field.clone(),
         }
     }
 }
@@ -145,6 +157,8 @@ impl std::fmt::Debug for LoadedCredential {
             .field("path_replacement", &self.path_replacement)
             .field("query_param_name", &self.query_param_name)
             .field("proxy_query_param_name", &self.proxy_query_param_name)
+            .field("body_field", &self.body_field)
+            .field("proxy_body_field", &self.proxy_body_field)
             .finish()
     }
 }
@@ -269,6 +283,12 @@ impl CredentialStore {
                                 .as_ref()
                                 .and_then(|p| p.query_param_name.clone())
                                 .or_else(|| route.query_param_name.clone()),
+                            body_field: route.body_field.clone(),
+                            proxy_body_field: route
+                                .proxy
+                                .as_ref()
+                                .and_then(|p| p.body_field.clone())
+                                .or_else(|| route.body_field.clone()),
                         },
                     );
                     continue;
@@ -322,7 +342,9 @@ impl CredentialStore {
                 );
 
                 let header_value = match route.inject_mode {
-                    InjectMode::Header => Zeroizing::new(effective_format.replace("{}", &secret)),
+                    InjectMode::Header | InjectMode::JsonBody => {
+                        Zeroizing::new(effective_format.replace("{}", &secret))
+                    }
                     InjectMode::BasicAuth => {
                         // Base64 encode the credential for Basic auth
                         let encoded =
@@ -364,6 +386,12 @@ impl CredentialStore {
                             .as_ref()
                             .and_then(|p| p.query_param_name.clone())
                             .or_else(|| route.query_param_name.clone()),
+                        body_field: route.body_field.clone(),
+                        proxy_body_field: route
+                            .proxy
+                            .as_ref()
+                            .and_then(|p| p.body_field.clone())
+                            .or_else(|| route.body_field.clone()),
                     },
                 );
                 continue;
@@ -925,6 +953,8 @@ mod tests {
             path_replacement: None,
             query_param_name: None,
             proxy_query_param_name: None,
+            body_field: None,
+            proxy_body_field: None,
         };
 
         let debug_output = format!("{:?}", cred);
@@ -967,6 +997,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: Some("MY_API_KEY".to_string()),
             endpoint_rules: vec![],
@@ -1003,6 +1034,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1126,6 +1158,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1171,6 +1204,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: Some("GH_TOKEN".to_string()),
             endpoint_rules: vec![],
@@ -1278,6 +1312,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1318,6 +1353,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1362,6 +1398,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: Some("MY_API_KEY".to_string()),
             endpoint_rules: vec![],
