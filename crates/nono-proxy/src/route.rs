@@ -159,6 +159,7 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
             }
             crate::config::InjectMode::UrlPath => NetworkAuditAuthMechanism::PhantomPath,
             crate::config::InjectMode::QueryParam => NetworkAuditAuthMechanism::PhantomQuery,
+            crate::config::InjectMode::JsonBody => NetworkAuditAuthMechanism::PhantomBody,
         });
     }
 
@@ -186,6 +187,7 @@ fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjection
             crate::config::InjectMode::UrlPath => NetworkAuditInjectionMode::UrlPath,
             crate::config::InjectMode::QueryParam => NetworkAuditInjectionMode::QueryParam,
             crate::config::InjectMode::BasicAuth => NetworkAuditInjectionMode::BasicAuth,
+            crate::config::InjectMode::JsonBody => NetworkAuditInjectionMode::JsonBody,
         });
     }
 
@@ -980,6 +982,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![
@@ -1034,6 +1037,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1066,6 +1070,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1099,6 +1104,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -1123,6 +1129,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -1210,6 +1217,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1256,6 +1264,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
@@ -1415,6 +1424,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1456,6 +1466,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: Some("INTERNAL_API_TOKEN".to_string()),
             endpoint_rules: vec![],
@@ -1502,6 +1513,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![EndpointRule {
@@ -1541,6 +1553,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1574,6 +1587,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1612,6 +1626,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1690,6 +1705,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
@@ -1725,6 +1741,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: Some("GH_TOKEN_A".to_string()),
                 endpoint_rules: vec![crate::config::EndpointRule {
@@ -1752,6 +1769,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: Some("GH_TOKEN_B".to_string()),
                 endpoint_rules: vec![crate::config::EndpointRule {
@@ -1833,6 +1851,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                body_field: None,
                 proxy: None,
                 env_var: Some(env.to_string()),
                 endpoint_rules: vec![crate::config::EndpointRule {
@@ -2250,6 +2269,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            body_field: None,
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],

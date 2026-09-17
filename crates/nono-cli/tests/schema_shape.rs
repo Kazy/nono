@@ -479,6 +479,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "path_pattern",
             "path_replacement",
             "query_param_name",
+            "body_field",
             "proxy",
             "env_var",
             "endpoint_rules",
