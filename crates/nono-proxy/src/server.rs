@@ -418,6 +418,14 @@ impl ProxyHandle {
         }
     }
 
+    /// Number of network audit events that did not fit in the in-memory buffer.
+    #[must_use]
+    pub fn omitted_audit_events(&self) -> u64 {
+        self.audit_log
+            .as_ref()
+            .map_or(0, audit::omitted_audit_events)
+    }
+
     /// Whether this proxy allocated the in-memory network audit buffer.
     #[must_use]
     pub fn network_audit_enabled(&self) -> bool {

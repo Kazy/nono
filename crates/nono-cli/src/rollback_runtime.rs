@@ -541,6 +541,9 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         })?;
         buffered_events.extend(supervisor_events.drain(..));
     }
+    let network_events_omitted = proxy_handle
+        .map(nono_proxy::server::ProxyHandle::omitted_audit_events)
+        .filter(|omitted| *omitted > 0);
     let mut unrecorded_network_events = Vec::new();
     let mut network_events = Vec::with_capacity(buffered_events.len());
     for buffered in buffered_events {
@@ -596,6 +599,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
             exit_code: Some(exit_code),
             merkle_roots,
             network_events: std::mem::take(&mut network_events),
+            network_events_omitted,
             audit_event_count,
             audit_integrity: audit_integrity.clone(),
             audit_attestation: None,
@@ -649,6 +653,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
             exit_code: Some(exit_code),
             merkle_roots,
             network_events,
+            network_events_omitted,
             audit_event_count,
             audit_integrity,
             audit_attestation: None,
@@ -950,6 +955,7 @@ mod tests {
             exit_code: Some(0),
             merkle_roots: Vec::new(),
             network_events: Vec::new(),
+            network_events_omitted: None,
             audit_event_count: 2,
             audit_integrity: Some(AuditIntegritySummary {
                 hash_algorithm: "sha256".to_string(),
@@ -1016,6 +1022,7 @@ mod tests {
             exit_code: Some(0),
             merkle_roots: Vec::new(),
             network_events: Vec::new(),
+            network_events_omitted: None,
             audit_event_count: 2,
             audit_integrity: None,
             audit_attestation: None,
@@ -1031,5 +1038,119 @@ mod tests {
 
         metadata.session_id = "20260421-200001-22222".to_string();
         assert!(!record_session_in_ledger(&metadata));
+    }
+
+    fn network_event(target: &str) -> nono::undo::NetworkAuditEvent {
+        nono::undo::NetworkAuditEvent {
+            timestamp_unix_ms: 123,
+            mode: nono::undo::NetworkAuditMode::Connect,
+            decision: nono::undo::NetworkAuditDecision::Allow,
+            route_id: None,
+            auth_mechanism: None,
+            auth_outcome: None,
+            managed_credential_active: None,
+            injection_mode: None,
+            denial_category: None,
+            endpoint_policy_action: None,
+            endpoint_policy_rule: None,
+            approval_backend: None,
+            credential_capture_action: None,
+            credential_capture_name: None,
+            credential_capture_command: None,
+            credential_capture_argv: None,
+            credential_capture_exit_status: None,
+            credential_capture_duration_ms: None,
+            credential_capture_stdout_bytes: None,
+            credential_capture_stderr: None,
+            credential_capture_cache_scope: None,
+            credential_capture_output_format: None,
+            credential_capture_header_names: None,
+            credential_capture_stdin_mode: None,
+            credential_capture_interactive: None,
+            target: target.to_string(),
+            upstream: None,
+            port: Some(443),
+            method: Some("CONNECT".to_string()),
+            path: None,
+            status: None,
+            reason: None,
+            spiffe_context: None,
+        }
+    }
+
+    #[test]
+    fn finalize_records_only_events_missed_live() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let audit_state = create_audit_state(false, None, Some("20261030-120000-1"))
+            .unwrap()
+            .unwrap();
+        let recorder = Mutex::new(AuditRecorder::new(audit_state.session_dir.clone()).unwrap());
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started("2026-10-30T12:00:00Z".to_string(), vec!["pi".to_string()])
+            .unwrap();
+
+        let live = network_event("live.example");
+        recorder
+            .lock()
+            .unwrap()
+            .record_network_event(live.clone())
+            .unwrap();
+        let supervisor_events = Mutex::new(vec![
+            nono_proxy::audit::BufferedAuditEvent {
+                event: live,
+                live_recorded: true,
+            },
+            nono_proxy::audit::BufferedAuditEvent {
+                event: network_event("missed.example"),
+                live_recorded: false,
+            },
+        ]);
+
+        let redaction_policy = nono::ScrubPolicy::secure_default();
+        let command = vec!["pi".to_string()];
+        let outcome = finalize_supervised_exit(RollbackExitContext {
+            audit_state: Some(&audit_state),
+            rollback_state: None,
+            audit_snapshot_state: None,
+            audit_tracked_paths: Vec::new(),
+            audit_recorder: Some(&recorder),
+            supervisor_network_audit_events: Some(&supervisor_events),
+            audit_integrity_enabled: true,
+            proxy_handle: None,
+            executable_identity: None,
+            audit_signer: None,
+            redaction_policy: &redaction_policy,
+            started: "2026-10-30T12:00:00Z",
+            ended: "2026-10-30T12:00:01Z",
+            command: &command,
+            exit_code: 0,
+            silent: true,
+            rollback_prompt_disabled: true,
+        })
+        .unwrap();
+        assert!(outcome.ledger_recorded);
+
+        let meta =
+            nono::undo::SnapshotManager::load_session_metadata(&audit_state.session_dir).unwrap();
+        // started + live + missed + ended: the live event is not recorded twice.
+        assert_eq!(meta.audit_event_count, 4);
+        let result = crate::audit_integrity::verify_audit_log(
+            &audit_state.session_dir,
+            meta.audit_integrity.as_ref(),
+        )
+        .unwrap();
+        assert!(result.records_verified);
+        assert!(result.event_count_matches);
+        assert_eq!(meta.network_events.len(), 2);
+        assert_eq!(meta.network_events_omitted, None);
     }
 }

@@ -269,6 +269,8 @@ struct SessionDigestPayload<'a> {
     // still hash to the digest they were committed to the ledger under.
     #[serde(skip_serializing_if = "Option::is_none")]
     command_policy_summary: &'a Option<CommandPolicySummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_events_omitted: &'a Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -868,6 +870,7 @@ pub fn canonical_session_digest_payload(metadata: &SessionMetadata) -> Result<Ve
         audit_integrity: &metadata.audit_integrity,
         audit_attestation: &metadata.audit_attestation,
         command_policy_summary: &metadata.command_policy_summary,
+        network_events_omitted: &metadata.network_events_omitted,
     };
     serde_json::to_vec(&payload).map_err(|e| {
         NonoError::Snapshot(format!("Failed to serialize session digest payload: {e}"))
@@ -2030,6 +2033,7 @@ mod tests {
             exit_code: Some(0),
             merkle_roots: Vec::new(),
             network_events: Vec::new(),
+            network_events_omitted: None,
             audit_event_count: 2,
             audit_integrity: None,
             audit_attestation: None,
@@ -2131,6 +2135,7 @@ mod tests {
                 status: Some(200),
                 reason: None,
             }],
+            network_events_omitted: None,
             audit_event_count: 9,
             audit_integrity: Some(AuditIntegritySummary {
                 hash_algorithm: "sha256".to_string(),
@@ -2159,6 +2164,18 @@ mod tests {
             merkle_root: ContentHash::from_bytes([3; 32]),
         });
         assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.network_events_omitted = Some(3);
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        // Sessions written before the field existed must keep their digest.
+        let payload = canonical_session_digest_payload(&base).unwrap();
+        assert!(
+            !String::from_utf8(payload)
+                .unwrap()
+                .contains("network_events_omitted")
+        );
     }
 
     #[test]

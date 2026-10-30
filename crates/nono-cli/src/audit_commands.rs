@@ -475,6 +475,9 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
                 );
             }
         }
+        if let Some(omitted) = session.metadata.network_events_omitted {
+            eprintln!("    ... {omitted} more proxy events are only in the audit event log");
+        }
     }
 
     let command_policy_events = command_policy_events_json(&session.dir)?;
@@ -876,6 +879,7 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
         "exit_code": session.metadata.exit_code,
         "merkle_roots": session.metadata.merkle_roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
         "network_events": &session.metadata.network_events,
+        "network_events_omitted": session.metadata.network_events_omitted,
         "command_policy_events": command_policy_events,
         "audit_event_count": session.metadata.audit_event_count,
         "audit_integrity": session.metadata.audit_integrity.as_ref().map(|summary| serde_json::json!({
@@ -990,6 +994,7 @@ mod list_tests {
             exit_code: Some(0),
             merkle_roots: vec![],
             network_events: vec![],
+            network_events_omitted: None,
             audit_event_count: 4,
             audit_integrity: None,
             audit_attestation: None,
@@ -1160,6 +1165,7 @@ mod tool_summary_tests {
                 exit_code: Some(0),
                 merkle_roots: Vec::new(),
                 network_events: Vec::new(),
+                network_events_omitted: None,
                 audit_event_count: 0,
                 audit_integrity: None,
                 audit_attestation: None,

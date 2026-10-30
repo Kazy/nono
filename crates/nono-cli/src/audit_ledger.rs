@@ -144,6 +144,7 @@ mod tests {
             exit_code: Some(0),
             merkle_roots: Vec::new(),
             network_events: Vec::new(),
+            network_events_omitted: None,
             audit_event_count: 2,
             audit_integrity: None,
             audit_attestation: None,
@@ -275,6 +276,7 @@ mod tests {
                 reason: None,
                 spiffe_context: None,
             }],
+            network_events_omitted: None,
             audit_event_count: 9,
             audit_integrity: Some(AuditIntegritySummary {
                 hash_algorithm: "sha256".to_string(),

@@ -288,6 +288,7 @@ mod tests {
                 exit_code: Some(0),
                 merkle_roots: Vec::new(),
                 network_events: Vec::new(),
+                network_events_omitted: None,
                 audit_event_count: 0,
                 audit_integrity: None,
                 audit_attestation: None,

@@ -520,6 +520,13 @@ pub struct SessionMetadata {
     /// Network events captured by the proxy during this session
     #[serde(default)]
     pub network_events: Vec<NetworkAuditEvent>,
+    /// Proxy network events that did not fit in `network_events`.
+    ///
+    /// The audit event log still holds them. Omitted rather than emitted as
+    /// null so that metadata written before the field existed keeps its
+    /// session digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_events_omitted: Option<u64>,
     /// Number of audit events captured for this session
     #[serde(default)]
     pub audit_event_count: u64,

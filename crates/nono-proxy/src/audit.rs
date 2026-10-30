@@ -7,6 +7,7 @@ use nono::undo::{
     NetworkAuditAuthMechanism, NetworkAuditAuthOutcome, NetworkAuditDecision,
     NetworkAuditDenialCategory, NetworkAuditEvent, NetworkAuditInjectionMode, NetworkAuditMode,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -48,6 +49,8 @@ pub struct BufferedAuditEvent {
 #[derive(Default)]
 pub struct AuditLog {
     events: Mutex<Vec<BufferedAuditEvent>>,
+    /// Events that did not fit in `events`. Session metadata reports the count.
+    omitted: AtomicU64,
     sink: RwLock<Option<AuditSink>>,
 }
 
@@ -174,6 +177,12 @@ pub fn drain_buffered_audit_events(audit_log: &SharedAuditLog) -> Vec<BufferedAu
     }
 }
 
+/// Number of events that did not fit in the in-memory buffer.
+#[must_use]
+pub fn omitted_audit_events(audit_log: &SharedAuditLog) -> u64 {
+    audit_log.omitted.load(Ordering::Relaxed)
+}
+
 fn now_unix_millis() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => {
@@ -281,17 +290,10 @@ fn push_event(audit_log: Option<&SharedAuditLog>, event: NetworkAuditEvent) {
                     event,
                     live_recorded,
                 });
-            } else if live_recorded {
-                warn!(
-                    "Network audit buffer full ({} events); event recorded live but omitted \
-                     from the session summary",
-                    MAX_AUDIT_EVENTS
-                );
             } else {
-                warn!(
-                    "Network audit buffer full ({} events); dropping event",
-                    MAX_AUDIT_EVENTS
-                );
+                // No warning: the proxy shares the terminal with the sandboxed
+                // TUI. Session metadata reports the count instead.
+                audit_log.omitted.fetch_add(1, Ordering::Relaxed);
             }
         }
         Err(e) => {
@@ -938,39 +940,32 @@ mod tests {
             *sink_delivered.lock().unwrap() += 1;
             Ok(())
         }));
-        let _warns = capture_warns(|| {
-            for _ in 0..=MAX_AUDIT_EVENTS {
-                log_connect(&log, "api.example.com");
-            }
-        });
+        for _ in 0..=MAX_AUDIT_EVENTS {
+            log_connect(&log, "api.example.com");
+        }
 
         assert_eq!(*delivered.lock().unwrap(), MAX_AUDIT_EVENTS + 1);
         assert_eq!(drain_audit_events(&log).len(), MAX_AUDIT_EVENTS);
+        assert_eq!(omitted_audit_events(&log), 1);
     }
 
     #[test]
-    fn enabled_buffer_keeps_cap_and_warns_on_overflow() {
+    fn overflow_counts_omitted_events_without_warning() {
         let log = new_audit_log();
         let warns = capture_warns(|| {
-            for _ in 0..=MAX_AUDIT_EVENTS {
-                log_allowed(
-                    Some(&log),
-                    ProxyMode::Connect,
-                    &EventContext::default(),
-                    "api.example.com",
-                    443,
-                    "CONNECT",
-                );
+            for index in 0..MAX_AUDIT_EVENTS + 100 {
+                log_connect(&log, &format!("h{index}"));
             }
         });
 
+        assert!(warns.is_empty(), "overflow must stay quiet, got {warns:?}");
+        assert_eq!(omitted_audit_events(&log), 100);
         let events = drain_audit_events(&log);
         assert_eq!(events.len(), MAX_AUDIT_EVENTS);
-        assert!(
-            warns
-                .iter()
-                .any(|message| message.contains("Network audit buffer full")),
-            "overflow must emit the buffer-full warning, got {warns:?}"
+        assert_eq!(events[0].target, "h0");
+        assert_eq!(
+            events[MAX_AUDIT_EVENTS - 1].target,
+            format!("h{}", MAX_AUDIT_EVENTS - 1)
         );
     }
 
